@@ -56,7 +56,7 @@ except ImportError:
 
 
 setup(name='pygeosearch',
-      version='0.0.1',
+      version='0.0.2',
       description='Geo search using redis',
       author="Pu Shi",
       author_email="mr.pu.shi@gmail.com",
@@ -71,4 +71,8 @@ setup(name='pygeosearch',
         'Operating System :: OS Independent',
         'Programming Language :: Python',
         'Programming Language :: Python :: 2.7'
+      ],
+      install_requires=[
+        'python-geohash==0.8.5',
+        'redis==2.10.3'
       ])
