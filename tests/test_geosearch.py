@@ -4,7 +4,7 @@ Unit-test for the geosearch module
 
 import unittest
 
-import geosearch as geosearch
+import pygeosearch.geosearch as geosearch
 import tests.mock_redis as mock_redis
 
 

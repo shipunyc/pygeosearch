@@ -5,13 +5,13 @@ The client for doing geo search.
 import geohash
 import math
 import redis
+import thread
 
 import pygeosearch.geohashsearch as geohashsearch
+import pygeosearch.rw_lock as rw_lock
+import pygeosearch.shared_redis as shared_redis
 
 
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
-REDIS_DB = 0
 PREFIX_K2L = 'pgsk2l'  # from key to location
 PREFIX_L2K = 'pgsl2k'  # from location to key
 
@@ -38,10 +38,13 @@ GEOHASH_CELL_SIZE = {
   12: (0.037, 0.019)
 }
 
+
 class GeoSearch(object):
   """ The client for doing geo search. """
 
   NUM_CELLS_IN_CIRCLE = 100
+  # We use reader-writer lock to make this class thread-safe.
+  _rw_lock = rw_lock.RWLock()
 
   def __init__(self, r=None, min_precision=4, max_precision=9):
     """Intializes a geo search client.
@@ -53,42 +56,64 @@ class GeoSearch(object):
     if r:
       self._r = r
     else:
-      self._r = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+      # It's ok to share redis because it's thread-safe for our case.
+      self._r = shared_redis.get_shared_redis()
     self._min_p = min_precision
     self._max_p = max_precision
 
   def put(self, lat, lon, key):
     """Adds or updates one key with its related latitude and longitude.
     Args:
-      lat: float, latitude
-      lon: float, longitude
-      key: str, the key to add to Redis.
+      - `lat`: float, latitude
+      - `lon`: float, longitude
+      - `key`: str, the key to add to Redis.
     """
-    new_cells = set([geohash.encode(lat, lon, precision=p)
-                     for p in range(self._min_p, self._max_p + 1)])
-    key_k2l = '%s:%s' % (PREFIX_K2L, key)
-    non_existing_cells = set([])
-    if self._r.exists(key_k2l):
-      old_cells = self._r.smembers(key_k2l)
-      non_existing_cells = old_cells - new_cells
-      new_cells = new_cells - old_cells
-    # Remove non-existing ones.
-    for one_cell in non_existing_cells:
-      self._r.srem(key_k2l, one_cell)
-      self._r.srem('%s:%s' % (PREFIX_L2K, one_cell), key)
-    # Add new ones.
-    for one_cell in new_cells:
-      self._r.sadd(key_k2l, one_cell)
-      self._r.sadd('%s:%s' % (PREFIX_L2K, one_cell), key)
+    GeoSearch._rw_lock.writer_acquire()
+    try:
+      new_cells = set([geohash.encode(lat, lon, precision=p)
+                       for p in range(self._min_p, self._max_p + 1)])
+      key_k2l = '%s:%s' % (PREFIX_K2L, key)
+      non_existing_cells = set([])
+      if self._r.exists(key_k2l):
+        old_cells = set(self._r.smembers(key_k2l))
+        non_existing_cells = old_cells - new_cells
+        new_cells = new_cells - old_cells
+      # Remove non-existing ones.
+      for one_cell in non_existing_cells:
+        self._r.srem(key_k2l, one_cell)
+        self._r.srem('%s:%s' % (PREFIX_L2K, one_cell), key)
+      # Add new ones.
+      for one_cell in new_cells:
+        self._r.sadd(key_k2l, one_cell)
+        self._r.sadd('%s:%s' % (PREFIX_L2K, one_cell), key)
+    finally:
+      GeoSearch._rw_lock.writer_release()
+
+  def rem(self, key):
+    """Removes a key.
+    Args:
+      - `key`: str, the key to remove from Redis
+    """
+    GeoSearch._rw_lock.writer_acquire()
+    try:
+      key_k2l = '%s:%s' % (PREFIX_K2L, key)
+      if not self._r.exists(key_k2l):
+        return  # Ignore the key if it doesn't exist.
+      old_cells = set(self._r.smembers(key_k2l))
+      for one_cell in old_cells:
+        self._r.srem(key_k2l, one_cell)
+        self._r.srem('%s:%s' % (PREFIX_L2K, one_cell), key)
+    finally:
+      GeoSearch._rw_lock.writer_release()
 
   @staticmethod
   def _estimate_best_precision(radius):
-    """Estimate the needed max resolution for the given radius.
+    """Estimate the best precision for the given radius.
     Args:
       radius: float
 
     Returns:
-      int, the needed max resolution.
+      int, the best precision.
     """
     # Ideally, we want to devide the circle into GeoSearch.NUM_CELLS_IN_CIRCLE
     # pieces.
@@ -109,7 +134,7 @@ class GeoSearch(object):
     Returns:
       list, the list of keys.
     """
-    # TODO: return an iterable of the keys instead of returning a list.
+    # TODO: Return an iterable of the keys instead of returning a list.
     best_p = GeoSearch._estimate_best_precision(distance)
     if best_p < self._min_p or best_p > self._max_p:
       raise ValueError('The best precision for this radius %f is %d, ' +
@@ -119,10 +144,18 @@ class GeoSearch(object):
     # Find the cells inside the circle.
     cells = geohashsearch.get_cells_in_circle(lat, lon, distance, best_p)
     results = []
-    for cell in cells:
-      redis_key = '%s:%s' % (PREFIX_L2K, cell)
-      if self._r.exists(redis_key):
-        results.extend(list(self._r.smembers('%s:%s' % (PREFIX_L2K, cell))))
-      if len(results) >= limit:
-        break
+    GeoSearch._rw_lock.reader_acquire()
+
+    try:
+      for cell in cells:
+        redis_key = '%s:%s' % (PREFIX_L2K, cell)
+        if self._r.exists(redis_key):
+          results.extend(list(self._r.smembers('%s:%s' % (PREFIX_L2K, cell))))
+        if len(results) >= limit:
+          break
+    finally:
+      GeoSearch._rw_lock.reader_release()
+
     return results[:limit]
+
+  # TODO: Implement other kinds of search methods.
