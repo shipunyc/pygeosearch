@@ -74,5 +74,5 @@ setup(name='pygeosearch',
       ],
       install_requires=[
         'python-geohash==0.8.5',
-        'redis==2.10.3'
+        'redis==4.4.4'
       ])
